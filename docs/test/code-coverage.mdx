@@ -141,6 +141,10 @@ Until JavaScriptCore distinguishes a block that opens a branch arm from one that
 merely continues after a terminator, *and* records the arm an `if` does not take,
 treat this output as a preview rather than a metric to gate on.
 
+You cannot gate on it in any case: `test.coverageThreshold` understands `lines`,
+`functions` and `statements` only. A `branches` key in that table is accepted and
+silently ignored, so it enforces nothing.
+
 Tools and services that read the LCOV format include:
 
 - **Code editors**: VS Code extensions can show coverage inline
