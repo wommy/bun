@@ -1,0 +1,52 @@
+--- NodesCodegen.cpp	2026-08-30 16:08:37.541730020 +0000
++++ patched.cpp	2026-08-30 16:16:28.585723624 +0000
+@@ -3468,8 +3468,10 @@
+             generator.emitNodeInConditionContext(m_expr1, afterExpr2.get(), afterExpr1.get(), FallThroughMeansFalse);
+         generator.emitLabel(afterExpr1.get());
+ 
++        generator.emitProfileControlFlow(m_expr2->startOffset());
+         generator.emitNodeInTailPosition(dst, m_expr2);
+         generator.emitLabel(afterExpr2.get());
++        generator.emitProfileControlFlow(m_expr2->endOffset() + 1);
+         return dst;
+     }
+ 
+@@ -3481,8 +3483,10 @@
+         generator.emitJumpIfFalse(temp.get(), target.get());
+     else
+         generator.emitJumpIfTrue(temp.get(), target.get());
++    generator.emitProfileControlFlow(m_expr2->startOffset());
+     generator.emitNodeInTailPosition(temp.get(), m_expr2);
+     generator.emitLabel(target.get());
++    generator.emitProfileControlFlow(m_expr2->endOffset() + 1);
+ 
+     return generator.move(dst, temp.get());
+ }
+@@ -3499,6 +3503,7 @@
+         generator.emitNodeInConditionContext(m_expr1, trueTarget, afterExpr1.get(), FallThroughMeansFalse);
+     generator.emitLabel(afterExpr1.get());
+ 
++    generator.emitProfileControlFlow(m_expr2->startOffset());
+     generator.emitNodeInConditionContext(m_expr2, trueTarget, falseTarget, fallThroughMode);
+ }
+ 
+@@ -3516,9 +3521,11 @@
+ 
+     if (m_hasAbsorbedOptionalChain)
+         generator.popOptionalChainTarget();
++    generator.emitProfileControlFlow(m_expr2->startOffset());
+     generator.emitNodeInTailPosition(temp.get(), m_expr2);
+ 
+     generator.emitLabel(endLabel.get());
++    generator.emitProfileControlFlow(m_expr2->endOffset() + 1);
+     return generator.move(dst, temp.get());
+ }
+ 
+@@ -3545,6 +3552,7 @@
+     }
+ 
+     generator.emitLabel(nullishTarget.get());
++    generator.emitProfileControlFlow(m_expr2->startOffset());
+     generator.emitNodeInConditionContext(m_expr2, trueTarget, falseTarget, fallThroughMode);
+ }
+ 

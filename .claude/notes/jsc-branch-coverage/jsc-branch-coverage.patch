@@ -1,0 +1,717 @@
+Subject: [PATCH] Control flow profiler: distinguish branch arms from continuations, and profile && || ??
+
+Bun derives lcov BRDA records from JSC basic blocks, and today that output is wrong twice over:
+
+  1. JSC opens a basic block after every `return`, `throw`, `break` and `continue`, and at the
+     join point after every `if`, loop and `switch`. The post-terminator ones are unreachable, so
+     they report as branches no test can cover; the join points are not decisions at all. A
+     branchless function, fully exercised, reports BRF:3 BRH:2.
+  2. `&&`, `||` and `??` are never profiled, so covering a short-circuit arm changes nothing.
+
+This adds `BasicBlockKind { Continuation, Branch }` and threads it from each emission site to the
+BasicBlockLocation the profiler hands back, and profiles the logical operators.
+
+Classification is per CALL SITE, not per AST node: a single node emits both kinds. All 28
+pre-existing `emitProfileControlFlow` sites were classified individually --
+
+  Branch (10):       ConditionalNode then-arm, ConditionalNode else-arm, IfElseNode then-arm,
+                     IfElseNode else-arm, WhileNode body, ForNode body, ForInNode body,
+                     ForOfNode body, CaseClauseNode clause, TryNode catch entry
+  Continuation (18): ConditionalNode join, IfElseNode join, WhileNode/ForNode/ForOfNode after-loop,
+                     ForInNode back-edge and after-loop, after continue/break/return/throw,
+                     SwitchNode join, TryNode catch join, both TryNode finally entries, TryNode
+                     finally join, program entry, function entry
+
+Eight new sites profile the logical operators (Branch at the RHS, Continuation at the join),
+following ConditionalNode's offset convention: `startOffset()` for an arm, `endOffset() + 1` for a
+join. The two condition-context variants have no join -- control leaves through trueTarget /
+falseTarget -- so they get only the Branch point.
+
+The kind travels in a parallel array on UnlinkedCodeBlock::RareData indexed identically to
+m_opProfileControlFlowBytecodeOffsets, rather than as a new op_profile_control_flow operand: the
+opcode's shape is baked into the LLInt, DFG and FTL, and nothing that executes it needs the kind.
+Only CodeBlock does, at link time. The array participates in the bytecode cache
+(CachedCodeBlockRareData) so a decoded block is indistinguishable from a freshly generated one.
+
+ControlFlowProfiler::getBasicBlockLocation caches on (startOffset, endOffset), so one location can
+be claimed by several CodeBlocks that disagree about the kind. Branch wins: the kind describes the
+source construct, so if any emission of a range is reached because a condition selected it, the
+range is a branch arm. Taking the maximum also makes the result independent of which CodeBlock
+links first, which lazy compilation would otherwise make nondeterministic.
+
+BasicBlockRange::m_kind is placed after m_hasExecuted, in padding that already existed, so
+sizeof(BasicBlockRange) and every pre-existing member offset are unchanged for out-of-tree
+consumers of ControlFlowProfiler.h.
+
+NOT COMPILED, NOT TESTED. Written against oven-sh/webkit main by editing fetched copies of the
+files; verified only to apply cleanly and to round-trip byte-for-byte.
+
+--- a/Source/JavaScriptCore/CMakeLists.txt
++++ b/Source/JavaScriptCore/CMakeLists.txt
+@@ -643,6 +643,7 @@
+     bytecode/ArithProfile.h
+     bytecode/ArrayAllocationProfile.h
+     bytecode/ArrayProfile.h
++    bytecode/BasicBlockKind.h
+     bytecode/BytecodeBasicBlock.h
+     bytecode/BytecodeConventions.h
+     bytecode/BytecodeDumper.h
+--- /dev/null
++++ b/Source/JavaScriptCore/bytecode/BasicBlockKind.h
+@@ -0,0 +1,52 @@
++/*
++ * Copyright (C) 2026 Apple Inc. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY APPLE INC. ``AS IS'' AND ANY
++ * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
++ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL APPLE INC. OR
++ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
++ * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
++ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
++ * PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
++ * OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#pragma once
++
++#include <cstdint>
++
++namespace JSC {
++
++// Why control reaches the top of a basic block recorded by the control flow profiler.
++//
++// The profiler opens a basic block after *every* construct that ends a flow of control, not just
++// at the arms of a conditional: the statement slot after `return`, `throw`, `break` and `continue`
++// gets one, and so does the join point after an `if`, a loop or a `switch`. Those blocks are not
++// decisions - the ones after a terminator are not even reachable - so a consumer that treats every
++// basic block as a branch (an lcov BRDA writer, say) reports branches that no test can ever cover.
++//
++// Branch marks the blocks that exist *because a condition selected this path*: the arms of
++// if/else and of ?:, the body of a loop, a switch case clause, a catch handler, and the
++// right-hand side of &&, || and ??. Continuation marks everything else.
++//
++// This is a property of the individual emission site, not of the AST node: a single node emits
++// both kinds. ConditionalNode, for instance, opens two Branch blocks (its two arms) and one
++// Continuation block (the join after the whole expression).
++enum class BasicBlockKind : uint8_t {
++    Continuation,
++    Branch,
++};
++
++} // namespace JSC
+--- a/Source/JavaScriptCore/bytecode/CodeBlock.cpp
++++ b/Source/JavaScriptCore/bytecode/CodeBlock.cpp
+@@ -3655,6 +3655,10 @@
+     if (!unlinkedCodeBlock()->hasOpProfileControlFlowBytecodeOffsets())
+         return;
+     const FixedVector<JSInstructionStream::Offset>& bytecodeOffsets = unlinkedCodeBlock()->opProfileControlFlowBytecodeOffsets();
++    // Indexed identically to bytecodeOffsets: entry i is the kind the bytecode generator recorded
++    // for the i'th op_profile_control_flow it emitted.
++    const FixedVector<BasicBlockKind>& basicBlockKinds = unlinkedCodeBlock()->opProfileControlFlowBasicBlockKinds();
++    ASSERT(basicBlockKinds.size() == bytecodeOffsets.size());
+     for (size_t i = 0, offsetsLength = bytecodeOffsets.size(); i < offsetsLength; i++) {
+         // Because op_profile_control_flow is emitted at the beginning of every basic block, finding
+         // the next op_profile_control_flow will give us the text range of a single basic block.
+@@ -3699,7 +3703,8 @@
+             continue;
+         }
+ 
+-        BasicBlockLocation* basicBlockLocation = vm().controlFlowProfiler()->getBasicBlockLocation(ownerExecutable()->sourceID(), basicBlockStartOffset, basicBlockEndOffset);
++        BasicBlockKind basicBlockKind = i < basicBlockKinds.size() ? basicBlockKinds[i] : BasicBlockKind::Continuation;
++        BasicBlockLocation* basicBlockLocation = vm().controlFlowProfiler()->getBasicBlockLocation(ownerExecutable()->sourceID(), basicBlockStartOffset, basicBlockEndOffset, basicBlockKind);
+ 
+         // Find all functions that are enclosed within the range: [basicBlockStartOffset, basicBlockEndOffset]
+         // and insert these functions' start/end offsets as gaps in the current BasicBlockLocation.
+--- a/Source/JavaScriptCore/bytecode/UnlinkedCodeBlock.cpp
++++ b/Source/JavaScriptCore/bytecode/UnlinkedCodeBlock.cpp
+@@ -143,6 +143,7 @@
+     size += m_unlinkedStringSwitchJumpTables.byteSize();
+     size += m_typeProfilerInfoMap.capacity() * sizeof(decltype(m_typeProfilerInfoMap)::KeyValuePairType);
+     size += m_opProfileControlFlowBytecodeOffsets.byteSize();
++    size += m_opProfileControlFlowBasicBlockKinds.byteSize();
+     size += m_bitVectors.byteSize();
+     // FIXME: account for each bit vector.
+     size += m_constantIdentifierSets.byteSize();
+--- a/Source/JavaScriptCore/bytecode/UnlinkedCodeBlock.h
++++ b/Source/JavaScriptCore/bytecode/UnlinkedCodeBlock.h
+@@ -27,6 +27,7 @@
+ 
+ #include "ArithProfile.h"
+ #include "ArrayProfile.h"
++#include "BasicBlockKind.h"
+ #include "BytecodeConventions.h"
+ #include "CodeType.h"
+ #include "DFGExitProfile.h"
+@@ -281,6 +282,14 @@
+     {
+         return m_rareData && !m_rareData->m_opProfileControlFlowBytecodeOffsets.isEmpty();
+     }
++    // Parallel to opProfileControlFlowBytecodeOffsets(): entry i describes the block that the i'th
++    // op_profile_control_flow opens. Always the same length as the offsets array - it is filled in
++    // by the same call that appends the offset, and round-trips through the bytecode cache.
++    const FixedVector<BasicBlockKind>& opProfileControlFlowBasicBlockKinds() const
++    {
++        ASSERT(m_rareData);
++        return m_rareData->m_opProfileControlFlowBasicBlockKinds;
++    }
+ 
+     void dumpExpressionInfo(); // For debugging purpose only.
+ 
+@@ -456,6 +465,7 @@
+         };
+         UncheckedKeyHashMap<unsigned, TypeProfilerExpressionRange> m_typeProfilerInfoMap;
+         FixedVector<JSInstructionStream::Offset> m_opProfileControlFlowBytecodeOffsets;
++        FixedVector<BasicBlockKind> m_opProfileControlFlowBasicBlockKinds;
+         FixedVector<BitVector> m_bitVectors;
+         FixedVector<IdentifierSet> m_constantIdentifierSets;
+ 
+--- a/Source/JavaScriptCore/bytecode/UnlinkedCodeBlockGenerator.cpp
++++ b/Source/JavaScriptCore/bytecode/UnlinkedCodeBlockGenerator.cpp
+@@ -92,6 +92,7 @@
+             m_codeBlock->m_rareData->m_unlinkedStringSwitchJumpTables = WTF::move(m_unlinkedStringSwitchJumpTables);
+             m_codeBlock->m_rareData->m_typeProfilerInfoMap = WTF::move(m_typeProfilerInfoMap);
+             m_codeBlock->m_rareData->m_opProfileControlFlowBytecodeOffsets = WTF::move(m_opProfileControlFlowBytecodeOffsets);
++            m_codeBlock->m_rareData->m_opProfileControlFlowBasicBlockKinds = WTF::move(m_opProfileControlFlowBasicBlockKinds);
+             m_codeBlock->m_rareData->m_bitVectors = WTF::move(m_bitVectors);
+             m_codeBlock->m_rareData->m_constantIdentifierSets = WTF::move(m_constantIdentifierSets);
+         }
+--- a/Source/JavaScriptCore/bytecode/UnlinkedCodeBlockGenerator.h
++++ b/Source/JavaScriptCore/bytecode/UnlinkedCodeBlockGenerator.h
+@@ -76,9 +76,10 @@
+     UnlinkedMetadataTable& metadata() { return m_codeBlock->metadata(); }
+     void addExpressionInfo(unsigned instructionOffset, unsigned divot, unsigned startOffset, unsigned endOffset, LineColumn);
+     void addTypeProfilerExpressionInfo(unsigned instructionOffset, unsigned startDivot, unsigned endDivot);
+-    void addOpProfileControlFlowBytecodeOffset(JSInstructionStream::Offset offset)
++    void addOpProfileControlFlowBytecodeOffset(JSInstructionStream::Offset offset, BasicBlockKind kind)
+     {
+         m_opProfileControlFlowBytecodeOffsets.append(offset);
++        m_opProfileControlFlowBasicBlockKinds.append(kind);
+     }
+ 
+     size_t numberOfUnlinkedSwitchJumpTables() const { return m_unlinkedSwitchJumpTables.size(); }
+@@ -209,6 +210,8 @@
+     Vector<UnlinkedStringJumpTable> m_unlinkedStringSwitchJumpTables;
+     UncheckedKeyHashMap<unsigned, UnlinkedCodeBlock::RareData::TypeProfilerExpressionRange> m_typeProfilerInfoMap;
+     Vector<JSInstructionStream::Offset> m_opProfileControlFlowBytecodeOffsets;
++    // Parallel to m_opProfileControlFlowBytecodeOffsets: entry i is the kind recorded at emission i.
++    Vector<BasicBlockKind> m_opProfileControlFlowBasicBlockKinds;
+     Vector<BitVector> m_bitVectors;
+     Vector<IdentifierSet> m_constantIdentifierSets;
+     unsigned m_numBinaryArithProfiles { 0 };
+--- a/Source/JavaScriptCore/bytecompiler/BytecodeGenerator.cpp
++++ b/Source/JavaScriptCore/bytecompiler/BytecodeGenerator.cpp
+@@ -2040,13 +2040,16 @@
+     emitTypeProfilerExpressionInfo(startDivot, endDivot);
+ }
+ 
+-void BytecodeGenerator::emitProfileControlFlow(int textOffset)
++void BytecodeGenerator::emitProfileControlFlow(int textOffset, BasicBlockKind kind)
+ {
+     if (shouldEmitControlFlowProfilerHooks()) {
+         RELEASE_ASSERT(textOffset >= 0);
+ 
+         OpProfileControlFlow::emit(this, textOffset);
+-        m_codeBlock->addOpProfileControlFlowBytecodeOffset(m_lastInstruction.offset());
++        // The kind rides alongside the offset instead of becoming an operand of
++        // op_profile_control_flow: the opcode's shape is baked into the LLInt, DFG and FTL, and
++        // nothing that executes the opcode needs the kind - only CodeBlock does, at link time.
++        m_codeBlock->addOpProfileControlFlowBytecodeOffset(m_lastInstruction.offset(), kind);
+     }
+ }
+ 
+--- a/Source/JavaScriptCore/bytecompiler/BytecodeGenerator.h
++++ b/Source/JavaScriptCore/bytecompiler/BytecodeGenerator.h
+@@ -30,6 +30,7 @@
+ 
+ #pragma once
+ 
++#include "BasicBlockKind.h"
+ #include "BytecodeGeneratorBase.h"
+ #include "BytecodeStructs.h"
+ #include "CodeBlock.h"
+@@ -702,7 +703,9 @@
+         // These are not associated with variables and don't have a global id.
+         void emitProfileType(RegisterID* registerToProfile, const JSTextPosition& startDivot, const JSTextPosition& endDivot);
+ 
+-        void emitProfileControlFlow(int);
++        // The kind is deliberately not defaulted: every call site has to decide whether the block
++        // it opens is a branch arm or a continuation. See BasicBlockKind.h.
++        void emitProfileControlFlow(int textOffset, BasicBlockKind);
+         
+         RegisterID* emitLoadArrowFunctionLexicalEnvironment(const Identifier&);
+         RegisterID* ensureThis();
+--- a/Source/JavaScriptCore/bytecompiler/NodesCodegen.cpp
++++ b/Source/JavaScriptCore/bytecompiler/NodesCodegen.cpp
+@@ -3468,8 +3468,10 @@
+             generator.emitNodeInConditionContext(m_expr1, afterExpr2.get(), afterExpr1.get(), FallThroughMeansFalse);
+         generator.emitLabel(afterExpr1.get());
+ 
++        generator.emitProfileControlFlow(m_expr2->startOffset(), BasicBlockKind::Branch);
+         generator.emitNodeInTailPosition(dst, m_expr2);
+         generator.emitLabel(afterExpr2.get());
++        generator.emitProfileControlFlow(m_expr2->endOffset() + 1, BasicBlockKind::Continuation);
+         return dst;
+     }
+ 
+@@ -3481,8 +3483,10 @@
+         generator.emitJumpIfFalse(temp.get(), target.get());
+     else
+         generator.emitJumpIfTrue(temp.get(), target.get());
++    generator.emitProfileControlFlow(m_expr2->startOffset(), BasicBlockKind::Branch);
+     generator.emitNodeInTailPosition(temp.get(), m_expr2);
+     generator.emitLabel(target.get());
++    generator.emitProfileControlFlow(m_expr2->endOffset() + 1, BasicBlockKind::Continuation);
+ 
+     return generator.move(dst, temp.get());
+ }
+@@ -3499,6 +3503,7 @@
+         generator.emitNodeInConditionContext(m_expr1, trueTarget, afterExpr1.get(), FallThroughMeansFalse);
+     generator.emitLabel(afterExpr1.get());
+ 
++    generator.emitProfileControlFlow(m_expr2->startOffset(), BasicBlockKind::Branch);
+     generator.emitNodeInConditionContext(m_expr2, trueTarget, falseTarget, fallThroughMode);
+ }
+ 
+@@ -3516,9 +3521,11 @@
+ 
+     if (m_hasAbsorbedOptionalChain)
+         generator.popOptionalChainTarget();
++    generator.emitProfileControlFlow(m_expr2->startOffset(), BasicBlockKind::Branch);
+     generator.emitNodeInTailPosition(temp.get(), m_expr2);
+ 
+     generator.emitLabel(endLabel.get());
++    generator.emitProfileControlFlow(m_expr2->endOffset() + 1, BasicBlockKind::Continuation);
+     return generator.move(dst, temp.get());
+ }
+ 
+@@ -3545,6 +3552,7 @@
+     }
+ 
+     generator.emitLabel(nullishTarget.get());
++    generator.emitProfileControlFlow(m_expr2->startOffset(), BasicBlockKind::Branch);
+     generator.emitNodeInConditionContext(m_expr2, trueTarget, falseTarget, fallThroughMode);
+ }
+ 
+@@ -3594,17 +3602,17 @@
+     generator.emitNodeInConditionContext(m_logical, beforeThen.get(), beforeElse.get(), FallThroughMeansTrue);
+     generator.emitLabel(beforeThen.get());
+ 
+-    generator.emitProfileControlFlow(m_expr1->startOffset());
++    generator.emitProfileControlFlow(m_expr1->startOffset(), BasicBlockKind::Branch);
+     generator.emitNodeInTailPosition(newDst.get(), m_expr1);
+     generator.emitJump(afterElse.get());
+ 
+     generator.emitLabel(beforeElse.get());
+-    generator.emitProfileControlFlow(m_expr1->endOffset() + 1);
++    generator.emitProfileControlFlow(m_expr1->endOffset() + 1, BasicBlockKind::Branch);
+     generator.emitNodeInTailPosition(newDst.get(), m_expr2);
+ 
+     generator.emitLabel(afterElse.get());
+ 
+-    generator.emitProfileControlFlow(m_expr2->endOffset() + 1);
++    generator.emitProfileControlFlow(m_expr2->endOffset() + 1, BasicBlockKind::Continuation);
+ 
+     return newDst.unsafeGet();
+ }
+@@ -4312,7 +4320,7 @@
+ 
+     generator.emitNodeInConditionContext(m_condition, *trueTarget, falseTarget, fallThroughMode);
+     generator.emitLabel(beforeThen.get());
+-    generator.emitProfileControlFlow(m_ifBlock->startOffset());
++    generator.emitProfileControlFlow(m_ifBlock->startOffset(), BasicBlockKind::Branch);
+ 
+     if (!didFoldIfBlock) {
+         generator.emitNodeInTailPosition(dst, m_ifBlock);
+@@ -4323,13 +4331,13 @@
+     generator.emitLabel(beforeElse.get());
+ 
+     if (m_elseBlock) {
+-        generator.emitProfileControlFlow(m_ifBlock->endOffset() + (m_ifBlock->isBlock() ? 1 : 0));
++        generator.emitProfileControlFlow(m_ifBlock->endOffset() + (m_ifBlock->isBlock() ? 1 : 0), BasicBlockKind::Branch);
+         generator.emitNodeInTailPosition(dst, m_elseBlock);
+     }
+ 
+     generator.emitLabel(afterElse.get());
+     StatementNode* endingBlock = m_elseBlock ? m_elseBlock : m_ifBlock;
+-    generator.emitProfileControlFlow(endingBlock->endOffset() + (endingBlock->isBlock() ? 1 : 0));
++    generator.emitProfileControlFlow(endingBlock->endOffset() + (endingBlock->isBlock() ? 1 : 0), BasicBlockKind::Continuation);
+ }
+ 
+ // ------------------------------ DoWhileNode ----------------------------------
+@@ -4368,7 +4376,7 @@
+     generator.emitLabel(topOfLoop.get());
+     generator.emitLoopHint();
+     
+-    generator.emitProfileControlFlow(m_statement->startOffset());
++    generator.emitProfileControlFlow(m_statement->startOffset(), BasicBlockKind::Branch);
+     generator.emitNodeInTailPosition(dst, m_statement);
+ 
+     generator.emitLabel(*scope->continueTarget());
+@@ -4377,7 +4385,7 @@
+ 
+     generator.emitLabel(scope->breakTarget());
+ 
+-    generator.emitProfileControlFlow(m_statement->endOffset() + (m_statement->isBlock() ? 1 : 0));
++    generator.emitProfileControlFlow(m_statement->endOffset() + (m_statement->isBlock() ? 1 : 0), BasicBlockKind::Continuation);
+ }
+ 
+ // ------------------------------ ForNode --------------------------------------
+@@ -4406,7 +4414,7 @@
+ 
+             generator.emitLabel(topOfLoop.get());
+             generator.emitLoopHint();
+-            generator.emitProfileControlFlow(m_statement->startOffset());
++            generator.emitProfileControlFlow(m_statement->startOffset(), BasicBlockKind::Branch);
+ 
+             generator.emitNodeInTailPosition(dst, m_statement);
+ 
+@@ -4425,7 +4433,7 @@
+     );
+ 
+     generator.popLexicalScope(this);
+-    generator.emitProfileControlFlow(m_statement->endOffset() + (m_statement->isBlock() ? 1 : 0));
++    generator.emitProfileControlFlow(m_statement->endOffset() + (m_statement->isBlock() ? 1 : 0), BasicBlockKind::Continuation);
+ }
+ 
+ // ------------------------------ ForInNode ------------------------------------
+@@ -4581,20 +4589,20 @@
+ 
+         this->emitLoopHeader(generator, propertyName.get());
+ 
+-        generator.emitProfileControlFlow(profilerStartOffset);
++        generator.emitProfileControlFlow(profilerStartOffset, BasicBlockKind::Branch);
+ 
+         generator.pushForInScope(local.get(), propertyName.get(), index.get(), enumerator.get(), mode.get(), baseVariable);
+         generator.emitNode(dst, m_statement);
+         generator.popForInScope(local.get());
+ 
+-        generator.emitProfileControlFlow(profilerEndOffset);
++        generator.emitProfileControlFlow(profilerEndOffset, BasicBlockKind::Continuation);
+         generator.emitJump(*scope->continueTarget());
+ 
+         generator.emitLabel(scope->breakTarget());
+     }
+ 
+     generator.popLexicalScope(this);
+-    generator.emitProfileControlFlow(profilerEndOffset);
++    generator.emitProfileControlFlow(profilerEndOffset, BasicBlockKind::Continuation);
+ }
+ 
+ // ------------------------------ ForOfNode ------------------------------------
+@@ -4659,7 +4667,7 @@
+                 DestructuringAssignmentNode* assignNode = static_cast<DestructuringAssignmentNode*>(m_lexpr);
+                 assignNode->bindings()->bindValue(generator, value);
+             }
+-            generator.emitProfileControlFlow(m_statement->startOffset());
++            generator.emitProfileControlFlow(m_statement->startOffset(), BasicBlockKind::Branch);
+             generator.emitNode(dst, m_statement);
+         };
+ 
+@@ -4671,7 +4679,7 @@
+     };
+     generator.emitEnumeration(this, m_expr, extractor, this, forLoopSymbolTable);
+     generator.popLexicalScope(this);
+-    generator.emitProfileControlFlow(m_statement->endOffset() + (m_statement->isBlock() ? 1 : 0));
++    generator.emitProfileControlFlow(m_statement->endOffset() + (m_statement->isBlock() ? 1 : 0), BasicBlockKind::Continuation);
+ }
+ 
+ // ------------------------------ ContinueNode ---------------------------------
+@@ -4702,7 +4710,7 @@
+         generator.emitJump(*scope->continueTarget());
+     }
+ 
+-    generator.emitProfileControlFlow(endOffset());
++    generator.emitProfileControlFlow(endOffset(), BasicBlockKind::Continuation);
+ }
+ 
+ // ------------------------------ BreakNode ------------------------------------
+@@ -4733,7 +4741,7 @@
+         generator.emitJump(scope->breakTarget());
+     }
+ 
+-    generator.emitProfileControlFlow(endOffset());
++    generator.emitProfileControlFlow(endOffset(), BasicBlockKind::Continuation);
+ }
+ 
+ // ------------------------------ ReturnNode -----------------------------------
+@@ -4766,7 +4774,7 @@
+         generator.emitReturn(returnRegister.get());
+     }
+ 
+-    generator.emitProfileControlFlow(endOffset());
++    generator.emitProfileControlFlow(endOffset(), BasicBlockKind::Continuation);
+     // Emitting an unreachable return here is needed in case this op_profile_control_flow is the
+     // last opcode in a CodeBlock because a CodeBlock's instructions must end with a terminal opcode.
+     if (generator.shouldEmitControlFlowProfilerHooks())
+@@ -4790,7 +4798,7 @@
+ 
+ inline void CaseClauseNode::emitBytecode(BytecodeGenerator& generator, RegisterID* dst)
+ {
+-    generator.emitProfileControlFlow(m_startOffset);
++    generator.emitProfileControlFlow(m_startOffset, BasicBlockKind::Branch);
+     if (!m_statements)
+         return;
+     m_statements->emitBytecode(generator, dst);
+@@ -4962,7 +4970,7 @@
+     generator.popLexicalScope(this);
+ 
+     generator.emitLabel(scope->breakTarget());
+-    generator.emitProfileControlFlow(endOffset());
++    generator.emitProfileControlFlow(endOffset(), BasicBlockKind::Continuation);
+ }
+ 
+ // ------------------------------ LabelNode ------------------------------------
+@@ -4987,7 +4995,7 @@
+     generator.emitExpressionInfo(divot(), divotStart(), divotEnd());
+     generator.emitThrow(expr.get());
+ 
+-    generator.emitProfileControlFlow(endOffset()); 
++    generator.emitProfileControlFlow(endOffset(), BasicBlockKind::Continuation);
+ }
+ 
+ // ------------------------------ TryNode --------------------------------------
+@@ -5073,7 +5081,7 @@
+             m_catchPattern->bindValue(generator, thrownValueRegister.get());
+         }
+ 
+-        generator.emitProfileControlFlow(m_tryBlock->endOffset() + 1);
++        generator.emitProfileControlFlow(m_tryBlock->endOffset() + 1, BasicBlockKind::Branch);
+ 
+         if (generator.shouldBeConcernedWithCompletionValue())
+             generator.emitLoad(tryCatchDst.get(), jsUndefined());
+@@ -5095,7 +5103,7 @@
+         }
+ 
+         generator.emitLabel(*catchEndLabel);
+-        generator.emitProfileControlFlow(m_catchBlock->endOffset() + 1);
++        generator.emitProfileControlFlow(m_catchBlock->endOffset() + 1, BasicBlockKind::Continuation);
+     }
+ 
+     if (m_finallyBlock) {
+@@ -5117,18 +5125,18 @@
+             if (m_finallyBlock->hasEarlyBreakOrContinue())
+                 generator.emitLoad(dst, jsUndefined());
+ 
+-            generator.emitProfileControlFlow(finallyStartOffset);
++            generator.emitProfileControlFlow(finallyStartOffset, BasicBlockKind::Continuation);
+             generator.emitNodeInTailPosition(dst, m_finallyBlock);
+ 
+             generator.move(dst, tryCatchDst.get());
+         } else {
+-            generator.emitProfileControlFlow(finallyStartOffset);
++            generator.emitProfileControlFlow(finallyStartOffset, BasicBlockKind::Continuation);
+             generator.emitNodeInTailPosition(m_finallyBlock);
+         }
+ 
+         generator.emitFinallyCompletion(finallyContext.value(), *finallyEndLabel);
+         generator.emitLabel(*finallyEndLabel);
+-        generator.emitProfileControlFlow(m_finallyBlock->endOffset() + 1);
++        generator.emitProfileControlFlow(m_finallyBlock->endOffset() + 1, BasicBlockKind::Continuation);
+     }
+ }
+ 
+@@ -5147,7 +5155,7 @@
+ 
+     RefPtr<RegisterID> dstRegister = generator.newTemporary();
+     generator.emitLoad(dstRegister.get(), jsUndefined());
+-    generator.emitProfileControlFlow(scopeNode.startStartOffset());
++    generator.emitProfileControlFlow(scopeNode.startStartOffset(), BasicBlockKind::Continuation);
+ 
+     generator.emitBodyWithUsingIfNeeded(scopeNode.usingDeclarationCount(), scopeNode.hasAwaitUsingDeclaration(),
+         [&](BytecodeGenerator& generator) {
+@@ -5207,7 +5215,7 @@
+         }
+     }
+ 
+-    generator.emitProfileControlFlow(startStartOffset());
++    generator.emitProfileControlFlow(startStartOffset(), BasicBlockKind::Continuation);
+     generator.emitDebugHook(DidEnterCallFrame, JSTextPosition(startLine(), startStartOffset(), startLineStartOffset()));
+ 
+     switch (generator.parseMode()) {
+--- a/Source/JavaScriptCore/runtime/BasicBlockLocation.cpp
++++ b/Source/JavaScriptCore/runtime/BasicBlockLocation.cpp
+@@ -36,9 +36,10 @@
+ 
+ WTF_MAKE_TZONE_ALLOCATED_IMPL(BasicBlockLocation);
+ 
+-BasicBlockLocation::BasicBlockLocation(int startOffset, int endOffset)
++BasicBlockLocation::BasicBlockLocation(int startOffset, int endOffset, BasicBlockKind kind)
+     : m_startOffset(startOffset)
+     , m_endOffset(endOffset)
++    , m_kind(kind)
+     , m_executionCount(0)
+ {
+ }
+--- a/Source/JavaScriptCore/runtime/BasicBlockLocation.h
++++ b/Source/JavaScriptCore/runtime/BasicBlockLocation.h
+@@ -26,6 +26,7 @@
+ 
+ #pragma once
+ 
++#include "BasicBlockKind.h"
+ #include "CPU.h"
+ #include "MacroAssembler.h"
+ #include <wtf/TZoneMalloc.h>
+@@ -41,10 +42,18 @@
+ public:
+     typedef std::pair<int, int> Gap;
+ 
+-    BasicBlockLocation(int startOffset = -1, int endOffset = -1);
++    BasicBlockLocation(int startOffset = -1, int endOffset = -1, BasicBlockKind = BasicBlockKind::Continuation);
+ 
+     int startOffset() const { return m_startOffset; }
+     int endOffset() const { return m_endOffset; }
++    BasicBlockKind kind() const { return m_kind; }
++    // A location is shared by every CodeBlock that compiles this text range, and they need not
++    // agree on the kind (see ControlFlowProfiler::getBasicBlockLocation). Branch is sticky.
++    void promoteKind(BasicBlockKind kind)
++    {
++        if (kind == BasicBlockKind::Branch)
++            m_kind = BasicBlockKind::Branch;
++    }
+     void setStartOffset(int startOffset) { m_startOffset = startOffset; }
+     void setEndOffset(int endOffset) { m_endOffset = endOffset; }
+     bool hasExecuted() const { return m_executionCount > 0; }
+@@ -61,6 +70,7 @@
+ 
+     int m_startOffset;
+     int m_endOffset;
++    BasicBlockKind m_kind;
+     Vector<Gap> m_gaps;
+     UCPURegister m_executionCount;
+ };
+--- a/Source/JavaScriptCore/runtime/CachedTypes.cpp
++++ b/Source/JavaScriptCore/runtime/CachedTypes.cpp
+@@ -2128,6 +2128,7 @@
+         m_unlinkedStringSwitchJumpTables.encode(encoder, rareData.m_unlinkedStringSwitchJumpTables);
+         m_typeProfilerInfoMap.encode(encoder, rareData.m_typeProfilerInfoMap);
+         m_opProfileControlFlowBytecodeOffsets.encode(encoder, rareData.m_opProfileControlFlowBytecodeOffsets);
++        m_opProfileControlFlowBasicBlockKinds.encode(encoder, rareData.m_opProfileControlFlowBasicBlockKinds);
+         m_bitVectors.encode(encoder, rareData.m_bitVectors);
+         m_constantIdentifierSets.encode(encoder, rareData.m_constantIdentifierSets);
+         m_needsClassFieldInitializer = rareData.m_needsClassFieldInitializer;
+@@ -2142,6 +2143,7 @@
+         m_unlinkedStringSwitchJumpTables.decode(decoder, rareData->m_unlinkedStringSwitchJumpTables);
+         m_typeProfilerInfoMap.decode(decoder, rareData->m_typeProfilerInfoMap);
+         m_opProfileControlFlowBytecodeOffsets.decode(decoder, rareData->m_opProfileControlFlowBytecodeOffsets);
++        m_opProfileControlFlowBasicBlockKinds.decode(decoder, rareData->m_opProfileControlFlowBasicBlockKinds);
+         m_bitVectors.decode(decoder, rareData->m_bitVectors);
+         m_constantIdentifierSets.decode(decoder, rareData->m_constantIdentifierSets);
+         rareData->m_needsClassFieldInitializer = m_needsClassFieldInitializer;
+@@ -2155,6 +2157,7 @@
+     CachedVector<CachedStringJumpTable> m_unlinkedStringSwitchJumpTables;
+     CachedHashMap<unsigned, UnlinkedCodeBlock::RareData::TypeProfilerExpressionRange> m_typeProfilerInfoMap;
+     CachedVector<JSInstructionStream::Offset> m_opProfileControlFlowBytecodeOffsets;
++    CachedVector<BasicBlockKind> m_opProfileControlFlowBasicBlockKinds;
+     CachedVector<CachedBitVector> m_bitVectors;
+     CachedVector<CachedHashSet<CachedRefPtr<CachedUniquedStringImpl>, IdentifierRepHash>> m_constantIdentifierSets;
+     unsigned m_needsClassFieldInitializer : 1;
+@@ -4950,7 +4953,7 @@
+ static_assert(sizeof(CachedBitVector) == 8);
+ static_assert(sizeof(CachedClassElementDefinition) == 24);
+ static_assert(sizeof(CachedCodeBlockExtras) == 12);
+-static_assert(sizeof(CachedCodeBlockRareData) == 60);
++static_assert(sizeof(CachedCodeBlockRareData) == 68);
+ static_assert(sizeof(CachedCompactTDZEnvironment) == 12);
+ static_assert(sizeof(CachedCompactTDZEnvironmentMapHandle) == 4);
+ static_assert(sizeof(CachedEvalCodeBlock) == 40);
+--- a/Source/JavaScriptCore/runtime/ControlFlowProfiler.cpp
++++ b/Source/JavaScriptCore/runtime/ControlFlowProfiler.cpp
+@@ -47,14 +47,28 @@
+     }
+ }
+ 
+-BasicBlockLocation* ControlFlowProfiler::getBasicBlockLocation(SourceID sourceID, int startOffset, int endOffset)
++BasicBlockLocation* ControlFlowProfiler::getBasicBlockLocation(SourceID sourceID, int startOffset, int endOffset, BasicBlockKind kind)
+ {
+     auto addResult = m_sourceIDBuckets.add(sourceID, BlockLocationCache());
+     BlockLocationCache& blockLocationCache = addResult.iterator->value;
+     BasicBlockKey key(startOffset, endOffset);
+     auto addResultForBasicBlock = blockLocationCache.add(key, nullptr);
+-    if (addResultForBasicBlock.isNewEntry)
+-        addResultForBasicBlock.iterator->value = new BasicBlockLocation(startOffset, endOffset);
++    if (addResultForBasicBlock.isNewEntry) {
++        addResultForBasicBlock.iterator->value = new BasicBlockLocation(startOffset, endOffset, kind);
++        return addResultForBasicBlock.iterator->value;
++    }
++
++    // The cache is keyed on the text range alone, so one location can be claimed by several
++    // CodeBlocks that disagree about the kind: the same source text compiles more than once
++    // (eval, a function body re-linked after its UnlinkedCodeBlock was evicted, the duplicated
++    // emission that ForInNode and TryNode's finally do), and a loop condition emitted twice can
++    // even put two different kinds on one range within a single CodeBlock.
++    //
++    // Branch wins. The kind describes the source construct, so if any emission of this exact
++    // range is reached because a condition selected it, the range really is a branch arm. Taking
++    // the maximum also makes the answer independent of which CodeBlock happens to link first,
++    // which lazy compilation would otherwise make nondeterministic.
++    addResultForBasicBlock.iterator->value->promoteKind(kind);
+     return addResultForBasicBlock.iterator->value;
+ }
+ 
+@@ -86,6 +100,7 @@
+         for (BasicBlockLocation::Gap gap : blockRanges) {
+             BasicBlockRange range;
+             range.m_hasExecuted = hasExecuted;
++            range.m_kind = block->kind();
+             range.m_executionCount = executionCount;
+             range.m_startOffset = gap.first;
+             range.m_endOffset = gap.second;
+@@ -111,6 +126,7 @@
+         for (BasicBlockLocation::Gap gap : blockRanges) {
+             BasicBlockRange range;
+             range.m_hasExecuted = hasExecuted;
++            range.m_kind = block->kind();
+             range.m_executionCount = executionCount;
+             range.m_startOffset = gap.first;
+             range.m_endOffset = gap.second;
+@@ -122,6 +138,7 @@
+     for (const auto& functionRange : functionRanges) {
+         BasicBlockRange range;
+         range.m_hasExecuted = std::get<0>(functionRange);
++        range.m_kind = BasicBlockKind::Continuation;
+         range.m_startOffset = static_cast<int>(std::get<1>(functionRange));
+         range.m_endOffset = static_cast<int>(std::get<2>(functionRange));
+         range.m_executionCount = range.m_hasExecuted ? 1 : 0; // This is a hack. We don't actually count this.
+@@ -137,6 +154,7 @@
+     BasicBlockRange bestRange;
+     bestRange.m_startOffset = bestRange.m_endOffset = -1;
+     bestRange.m_hasExecuted = false; // Suppress MSVC warning.
++    bestRange.m_kind = BasicBlockKind::Continuation;
+     // Because some ranges may overlap because of function boundaries, make sure to find the smallest range enclosing the offset.
+     for (BasicBlockRange range : blocks) {
+         if (range.m_startOffset <= offset && offset <= range.m_endOffset && (range.m_endOffset - range.m_startOffset) < bestDistance) {
+--- a/Source/JavaScriptCore/runtime/ControlFlowProfiler.h
++++ b/Source/JavaScriptCore/runtime/ControlFlowProfiler.h
+@@ -77,6 +77,10 @@
+     int m_startOffset;
+     int m_endOffset;
+     bool m_hasExecuted;
++    // Placed here rather than after m_executionCount on purpose: it lands in the padding that
++    // already followed m_hasExecuted, so sizeof(BasicBlockRange) and the offsets of every
++    // pre-existing member are unchanged for out-of-tree consumers of this header.
++    BasicBlockKind m_kind;
+     size_t m_executionCount;
+ };
+ 
+@@ -85,7 +89,7 @@
+ public:
+     ControlFlowProfiler();
+     ~ControlFlowProfiler();
+-    BasicBlockLocation* getBasicBlockLocation(SourceID, int startOffset, int endOffset);
++    BasicBlockLocation* getBasicBlockLocation(SourceID, int startOffset, int endOffset, BasicBlockKind);
+     JS_EXPORT_PRIVATE void dumpData() const;
+     JS_EXPORT_PRIVATE Vector<BasicBlockRange> getBasicBlocksForSourceID(SourceID, VM&) const;
+     JS_EXPORT_PRIVATE Vector<BasicBlockRange> getBasicBlocksForSourceIDWithoutFunctionRange(SourceID, VM&) const;
