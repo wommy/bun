@@ -1227,7 +1227,7 @@ pub struct ByteRange {
 /// parent, so what reaches us is a flat set of disjoint ranges. This is
 /// therefore V8-style *block* coverage, not Istanbul `branchMap` coverage:
 /// every block is one `BRDA` entry rather than one arm of a grouped branch.
-#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BranchRecord {
     /// Zero-based line in the original source.
     pub line: u32,
@@ -1260,5 +1260,83 @@ impl ByteRange {
             start: u32::try_from(min).expect("int cast"),
             end: u32::try_from(max).expect("int cast"),
         }
+    }
+}
+
+#[cfg(test)]
+mod branch_tests {
+    use super::*;
+
+    /// A report with no lines or functions, carrying only `branches` — enough
+    /// for the wire codec and the merger.
+    ///
+    /// There is deliberately no test here for `lcov::write_format`'s BRDA
+    /// output. It reaches `bun_paths::resolve_path::relative`, whose
+    /// `bun_core::strings` calls are backed by Highway; linking this test
+    /// binary against it needs `vendor/highway` built, which a plain
+    /// `cargo test` does not do. The formatting is covered by
+    /// test/cli/test/coverage.test.ts instead.
+    fn report(branches: Vec<BranchRecord>) -> Report<'static> {
+        const LINES: usize = 16;
+        Report {
+            source_url: Cow::Owned(b"a.ts".to_vec()),
+            executable_lines: Bitset::init_empty(LINES).unwrap(),
+            lines_which_have_executed: Bitset::init_empty(LINES).unwrap(),
+            line_hits: vec![0u32; LINES],
+            functions: Vec::new(),
+            functions_which_have_executed: Bitset::init_empty(0).unwrap(),
+            stmts: Vec::new(),
+            stmts_which_have_executed: Bitset::init_empty(0).unwrap(),
+            branches,
+        }
+    }
+
+    #[test]
+    fn wire_round_trip_preserves_branches() {
+        let branches = vec![
+            BranchRecord { line: 0, start: 1, taken: 0 },
+            BranchRecord { line: 7, start: 99, taken: u32::MAX },
+        ];
+        let mut buf: Vec<u8> = Vec::new();
+        wire::encode(&report(branches.clone()), &mut buf);
+        let decoded = wire::decode(&buf).expect("decode");
+        assert_eq!(decoded.branches, branches);
+    }
+
+    #[test]
+    fn merge_sums_taken_for_the_same_block() {
+        // The same file loaded by two workers: counts add, distinct blocks stay
+        // distinct, and the result is ordered by (line, start).
+        let mut merged = MergedReport::default();
+        merged
+            .add(&report(vec![
+                BranchRecord { line: 2, start: 5, taken: 2 },
+                BranchRecord { line: 1, start: 3, taken: 0 },
+            ]))
+            .unwrap();
+        merged
+            .add(&report(vec![
+                BranchRecord { line: 2, start: 5, taken: 4 },
+                BranchRecord { line: 1, start: 3, taken: 1 },
+            ]))
+            .unwrap();
+        assert_eq!(
+            merged.finish().unwrap().branches,
+            vec![
+                BranchRecord { line: 1, start: 3, taken: 1 },
+                BranchRecord { line: 2, start: 5, taken: 6 },
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_saturates_rather_than_overflowing() {
+        let mut merged = MergedReport::default();
+        for _ in 0..2 {
+            merged
+                .add(&report(vec![BranchRecord { line: 0, start: 0, taken: u32::MAX }]))
+                .unwrap();
+        }
+        assert_eq!(merged.finish().unwrap().branches[0].taken, u32::MAX);
     }
 }
