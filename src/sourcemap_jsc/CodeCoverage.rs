@@ -1319,9 +1319,21 @@ mod branch_tests {
         // Two blocks on line 4 (zero-based), one on line 9. lcov lines are
         // 1-based and the branch number is the ordinal within the line.
         let (out, hit) = brda(&[
-            BranchRecord { line: 4, start: 10, taken: 3 },
-            BranchRecord { line: 4, start: 20, taken: 0 },
-            BranchRecord { line: 9, start: 30, taken: 1 },
+            BranchRecord {
+                line: 4,
+                start: 10,
+                taken: 3,
+            },
+            BranchRecord {
+                line: 4,
+                start: 20,
+                taken: 0,
+            },
+            BranchRecord {
+                line: 9,
+                start: 30,
+                taken: 1,
+            },
         ]);
         assert_eq!(out, b"BRDA:5,0,0,3\nBRDA:5,0,1,0\nBRDA:10,0,0,1\n".to_vec());
         // The untaken arm on line 5 must not count toward BRH.
@@ -1336,8 +1348,16 @@ mod branch_tests {
     #[test]
     fn wire_round_trip_preserves_branches() {
         let branches = vec![
-            BranchRecord { line: 0, start: 1, taken: 0 },
-            BranchRecord { line: 7, start: 99, taken: u32::MAX },
+            BranchRecord {
+                line: 0,
+                start: 1,
+                taken: 0,
+            },
+            BranchRecord {
+                line: 7,
+                start: 99,
+                taken: u32::MAX,
+            },
         ];
         let mut buf: Vec<u8> = Vec::new();
         wire::encode(&report(branches.clone()), &mut buf);
@@ -1352,21 +1372,45 @@ mod branch_tests {
         let mut merged = MergedReport::default();
         merged
             .add(&report(vec![
-                BranchRecord { line: 2, start: 5, taken: 2 },
-                BranchRecord { line: 1, start: 3, taken: 0 },
+                BranchRecord {
+                    line: 2,
+                    start: 5,
+                    taken: 2,
+                },
+                BranchRecord {
+                    line: 1,
+                    start: 3,
+                    taken: 0,
+                },
             ]))
             .unwrap();
         merged
             .add(&report(vec![
-                BranchRecord { line: 2, start: 5, taken: 4 },
-                BranchRecord { line: 1, start: 3, taken: 1 },
+                BranchRecord {
+                    line: 2,
+                    start: 5,
+                    taken: 4,
+                },
+                BranchRecord {
+                    line: 1,
+                    start: 3,
+                    taken: 1,
+                },
             ]))
             .unwrap();
         assert_eq!(
             merged.finish().unwrap().branches,
             vec![
-                BranchRecord { line: 1, start: 3, taken: 1 },
-                BranchRecord { line: 2, start: 5, taken: 6 },
+                BranchRecord {
+                    line: 1,
+                    start: 3,
+                    taken: 1
+                },
+                BranchRecord {
+                    line: 2,
+                    start: 5,
+                    taken: 6
+                },
             ]
         );
     }
@@ -1376,7 +1420,11 @@ mod branch_tests {
         let mut merged = MergedReport::default();
         for _ in 0..2 {
             merged
-                .add(&report(vec![BranchRecord { line: 0, start: 0, taken: u32::MAX }]))
+                .add(&report(vec![BranchRecord {
+                    line: 0,
+                    start: 0,
+                    taken: u32::MAX,
+                }]))
                 .unwrap();
         }
         assert_eq!(merged.finish().unwrap().branches[0].taken, u32::MAX);
