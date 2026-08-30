@@ -878,6 +878,13 @@ impl ByteRangeMapping {
                     max_line = max_line.max(line);
                 }
 
+                // no lines resolved? ignore it, as the source-map path does. A
+                // zero-width function range leaves min_line unset, and the
+                // `fill` below would index [u32::MAX..0] and panic.
+                if min_line == u32::MAX && max_line == 0 {
+                    continue;
+                }
+
                 let did_fn_execute = function.execution_count > 0 || function.has_executed;
 
                 // only mark the lines as executable if the function has not executed

@@ -783,3 +783,43 @@ test("one arm", () => {
   expect(first).toBe(second);
   expect(first).not.toBe("");
 });
+
+// Pins documented behavior: docs/test/code-coverage.mdx says of the object
+// form that "a key you omit keeps the `0.9` default". Only `lines` is named
+// here, and its threshold cannot fail; the run must still exit 1 because the
+// omitted `functions` key keeps that default and only one of three functions
+// runs. Nothing covered this, which is what made the behavior easy to mistake
+// for a bug.
+test("coverageThreshold object: an omitted key keeps the 0.9 default", async () => {
+  using dir = tempDir("cov-threshold", {
+    "bunfig.toml": `[test]\ncoverageSkipTestFiles = true\ncoverageThreshold = { lines = 0.0 }\n`,
+    "lib.js": `export function used() {
+  return 1;
+}
+export function unused() {
+  return 2;
+}
+export function alsoUnused() {
+  return 3;
+}
+`,
+    "lib.test.js": `import { test, expect } from "bun:test";
+import { used } from "./lib.js";
+test("uses one of three", () => {
+  expect(used()).toBe(1);
+});
+`,
+  });
+
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "test", "--coverage"],
+    env: bunEnv,
+    cwd: String(dir),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+  expect(stderr).toContain("lib.js");
+  expect(exitCode).toBe(1);
+});
