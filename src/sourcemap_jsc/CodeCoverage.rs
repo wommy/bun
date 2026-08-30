@@ -543,6 +543,46 @@ pub mod text {
 pub mod lcov {
     use super::*;
 
+    /// Writes the `BRDA:<line>,<block>,<branch>,<taken>` records for `branches`
+    /// and returns how many were hit.
+    ///
+    /// JSC's control-flow profiler reports no branch grouping, so each basic
+    /// block is its own single-branch block: block number 0, and a branch
+    /// number that is the block's ordinal on its line. `branches` is sorted by
+    /// `(line, start)`, so those ordinals are stable run to run.
+    ///
+    /// Split out of `write_format` so it can be unit-tested: `write_format`
+    /// reaches `bun_paths::resolve_path::relative`, and linking a test binary
+    /// against that needs Highway's SIMD kernels built, which `cargo test`
+    /// does not do.
+    pub(crate) fn write_branch_records(
+        branches: &[BranchRecord],
+        writer: &mut impl bun_io::Write,
+    ) -> bun_io::Result<usize> {
+        let mut branch_number: u32 = 0;
+        let mut prev_line = u32::MAX;
+        let mut hit: usize = 0;
+        for branch in branches {
+            if branch.line == prev_line {
+                branch_number += 1;
+            } else {
+                branch_number = 0;
+                prev_line = branch.line;
+            }
+            if branch.taken > 0 {
+                hit += 1;
+            }
+            writeln!(
+                writer,
+                "BRDA:{},0,{},{}",
+                branch.line + 1,
+                branch_number,
+                branch.taken
+            )?;
+        }
+        Ok(hit)
+    }
+
     pub fn write_format(
         report: &Report,
         base_path: &[u8],
@@ -582,33 +622,7 @@ pub mod lcov {
             report.functions_which_have_executed.count()
         )?;
 
-        // BRDA: line, block number, branch number, taken
-        //
-        // JSC's control-flow profiler reports no branch grouping, so each basic
-        // block is emitted as its own single-branch block: block number 0 and a
-        // branch number that is the block's ordinal on its line. `report.branches`
-        // is sorted by `(line, start)`, so those ordinals are stable run to run.
-        let mut branch_number: u32 = 0;
-        let mut prev_line = u32::MAX;
-        let mut branches_hit: usize = 0;
-        for branch in &report.branches {
-            if branch.line == prev_line {
-                branch_number += 1;
-            } else {
-                branch_number = 0;
-                prev_line = branch.line;
-            }
-            if branch.taken > 0 {
-                branches_hit += 1;
-            }
-            writeln!(
-                writer,
-                "BRDA:{},0,{},{}",
-                branch.line + 1,
-                branch_number,
-                branch.taken
-            )?;
-        }
+        let branches_hit = write_branch_records(&report.branches, writer)?;
 
         // BRF: branches found
         writeln!(writer, "BRF:{}", report.branches.len())?;
@@ -1267,15 +1281,24 @@ impl ByteRange {
 mod branch_tests {
     use super::*;
 
+    /// The BRDA lines `write_branch_records` produces for `branches`.
+    ///
+    /// This calls the helper rather than `lcov::write_format`, which reaches
+    /// `bun_paths::resolve_path::relative`; linking a test binary against that
+    /// needs Highway's SIMD kernels, which `cargo test` does not build.
+    fn brda(branches: &[BranchRecord]) -> (Vec<String>, usize) {
+        let mut buf: Vec<u8> = Vec::new();
+        let hit = lcov::write_branch_records(branches, &mut buf).unwrap();
+        let lines = String::from_utf8(buf)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        (lines, hit)
+    }
+
     /// A report with no lines or functions, carrying only `branches` — enough
     /// for the wire codec and the merger.
-    ///
-    /// There is deliberately no test here for `lcov::write_format`'s BRDA
-    /// output. It reaches `bun_paths::resolve_path::relative`, whose
-    /// `bun_core::strings` calls are backed by Highway; linking this test
-    /// binary against it needs `vendor/highway` built, which a plain
-    /// `cargo test` does not do. The formatting is covered by
-    /// test/cli/test/coverage.test.ts instead.
     fn report(branches: Vec<BranchRecord>) -> Report<'static> {
         const LINES: usize = 16;
         Report {
@@ -1289,6 +1312,25 @@ mod branch_tests {
             stmts_which_have_executed: Bitset::init_empty(0).unwrap(),
             branches,
         }
+    }
+
+    #[test]
+    fn branch_number_restarts_on_each_line() {
+        // Two blocks on line 4 (zero-based), one on line 9. lcov lines are
+        // 1-based and the branch number is the ordinal within the line.
+        let (lines, hit) = brda(&[
+            BranchRecord { line: 4, start: 10, taken: 3 },
+            BranchRecord { line: 4, start: 20, taken: 0 },
+            BranchRecord { line: 9, start: 30, taken: 1 },
+        ]);
+        assert_eq!(lines, vec!["BRDA:5,0,0,3", "BRDA:5,0,1,0", "BRDA:10,0,0,1"]);
+        // The untaken arm on line 5 must not count toward BRH.
+        assert_eq!(hit, 2);
+    }
+
+    #[test]
+    fn no_branches_emits_nothing_and_no_hits() {
+        assert_eq!(brda(&[]), (Vec::new(), 0));
     }
 
     #[test]
