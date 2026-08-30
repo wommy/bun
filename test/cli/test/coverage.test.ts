@@ -635,7 +635,9 @@ test("only imports the function", () => {
   const record = lcov.split("end_of_record").find(r => r.includes("SF:subject.ts"));
   expect(record).toBeDefined();
   // Blank line 5 is only "executable" in the worker that never ran count().
-  expect(record).not.toContain("DA:5,");
+  // Anchored: a plain substring check also matches the `BRDA:5,` branch
+  // records, which are a different assertion entirely.
+  expect(record).not.toMatch(/^DA:5,/m);
   expect(record).toMatch(/LF:4\nLH:4\n/);
 
   expect(stderr).toMatch(/ subject\.ts +\| +100\.00 +\| +100\.00 +\| +\n/);
