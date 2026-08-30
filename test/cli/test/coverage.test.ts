@@ -697,3 +697,89 @@ test("calls second", () => {
   expect(record).toMatch(/FNF:2\nFNH:2\n/);
   expect(exitCode).toBe(0);
 });
+
+test("lcov reporter emits branch records", async () => {
+  using dir = tempDir("cov-branches", {
+    "branches.ts": `export function classify(n: number) {
+  if (n > 0) {
+    return "pos";
+  } else {
+    return "neg";
+  }
+}
+`,
+    "branches.test.ts": `import { test, expect } from "bun:test";
+import { classify } from "./branches";
+test("only the positive arm", () => {
+  expect(classify(1)).toBe("pos");
+});
+`,
+  });
+
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "test", "--coverage", "--coverage-reporter=lcov"],
+    env: bunEnv,
+    cwd: String(dir),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+  const lcov = readFileSync(path.join(String(dir), "coverage", "lcov.info"), "utf-8");
+  const record = lcov.split("end_of_record").find(r => r.includes("SF:branches.ts"))!;
+  expect(record).toBeDefined();
+
+  // The `else` arm never runs, so the file must report more branches found
+  // than hit, with at least one BRDA whose taken count is 0.
+  const found = Number(record.match(/^BRF:(\d+)$/m)![1]);
+  const hit = Number(record.match(/^BRH:(\d+)$/m)![1]);
+  expect(found).toBeGreaterThan(0);
+  expect(hit).toBeGreaterThan(0);
+  expect(hit).toBeLessThan(found);
+  expect(record).toMatch(/^BRDA:\d+,0,\d+,0$/m);
+
+  // BRF/BRH must agree with the BRDA records they summarize.
+  const brda = [...record.matchAll(/^BRDA:(\d+),0,(\d+),(\d+)$/gm)];
+  expect(brda.length).toBe(found);
+  expect(brda.filter(m => Number(m[3]) > 0).length).toBe(hit);
+
+  expect(exitCode).toBe(0);
+});
+
+test("lcov branch records are stable across runs", async () => {
+  const files = {
+    "stable.ts": `export function pick(n: number) {
+  return n === 1 ? "one" : n === 2 ? "two" : "three";
+}
+`,
+    "stable.test.ts": `import { test, expect } from "bun:test";
+import { pick } from "./stable";
+test("one arm", () => {
+  expect(pick(1)).toBe("one");
+});
+`,
+  };
+
+  const runOnce = async () => {
+    using dir = tempDir("cov-branch-stable", files);
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "test", "--coverage", "--coverage-reporter=lcov"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(exitCode).toBe(0);
+    const lcov = readFileSync(path.join(String(dir), "coverage", "lcov.info"), "utf-8");
+    const record = lcov.split("end_of_record").find(r => r.includes("SF:stable.ts"))!;
+    return [...record.matchAll(/^BRDA:.*$/gm)].map(m => m[0]).join("\n");
+  };
+
+  // JSC iterates its basic-block cache in hash order, so the branch ordinals
+  // are only reproducible because the report sorts by (line, start).
+  const first = await runOnce();
+  const second = await runOnce();
+  expect(first).toBe(second);
+  expect(first).not.toBe("");
+});

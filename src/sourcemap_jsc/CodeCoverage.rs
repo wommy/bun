@@ -40,6 +40,10 @@ pub struct Report<'a> {
     /// Indexed in step with `stmts_which_have_executed`.
     pub(crate) stmts: Vec<ByteRange>,
     pub(crate) stmts_which_have_executed: Bitset,
+    /// One entry per JSC basic block, for lcov `BRDA`. Sorted by
+    /// `(line, start)` so the per-line branch ordinals lcov wants are stable
+    /// across runs; JSC hands us blocks in hash-table order.
+    pub(crate) branches: Vec<BranchRecord>,
 }
 
 impl<'a> Report<'a> {
@@ -146,6 +150,7 @@ impl<'a> Report<'a> {
 ///        words, line_count × u32 hits
 ///   u32  n_functions, then n × {u32 start, u32 end}, executed words
 ///   u32  n_stmts, same shape
+///   u32  n_branches, then n × {u32 line, u32 start, u32 taken}
 pub mod wire {
     use super::*;
 
@@ -183,6 +188,12 @@ pub mod wire {
             &report.functions_which_have_executed,
         );
         put_ranges(out, &report.stmts, &report.stmts_which_have_executed);
+        put_u32(out, u32::try_from(report.branches.len()).expect("int cast"));
+        for b in &report.branches {
+            put_u32(out, b.line);
+            put_u32(out, b.start);
+            put_u32(out, b.taken);
+        }
     }
 
     struct Reader<'a>(&'a [u8]);
@@ -202,6 +213,22 @@ pub mod wire {
         fn bitset(&mut self, bit_length: usize) -> Option<Bitset> {
             let words = bit_length.div_ceil(usize::BITS as usize) * core::mem::size_of::<usize>();
             Bitset::from_bytes(bit_length, self.bytes(words)?).ok()?
+        }
+        fn branches(&mut self) -> Option<Vec<BranchRecord>> {
+            let n = self.len()?;
+            // Bound the allocation by what the input can actually hold.
+            if n.checked_mul(12)? > self.0.len() {
+                return None;
+            }
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..n {
+                out.push(BranchRecord {
+                    line: self.u32()?,
+                    start: self.u32()?,
+                    taken: self.u32()?,
+                });
+            }
+            Some(out)
         }
         fn ranges(&mut self) -> Option<(Vec<ByteRange>, Bitset)> {
             let n = self.len()?;
@@ -233,6 +260,7 @@ pub mod wire {
             .copy_from_slice(r.bytes(line_count * 4)?);
         let (functions, functions_which_have_executed) = r.ranges()?;
         let (stmts, stmts_which_have_executed) = r.ranges()?;
+        let branches = r.branches()?;
         if !r.0.is_empty() {
             return None;
         }
@@ -245,6 +273,7 @@ pub mod wire {
             functions_which_have_executed,
             stmts,
             stmts_which_have_executed,
+            branches,
         })
     }
 }
@@ -269,6 +298,8 @@ pub struct MergedReport {
     /// Every report's ranges with their executed bit; deduplicated in `finish`.
     functions: Vec<(ByteRange, bool)>,
     stmts: Vec<(ByteRange, bool)>,
+    /// Every report's branch records; summed per `(line, start)` in `finish`.
+    branches: Vec<BranchRecord>,
 }
 
 impl MergedReport {
@@ -308,6 +339,7 @@ impl MergedReport {
             self.stmts
                 .push((r, report.stmts_which_have_executed.is_set(i)));
         }
+        self.branches.extend_from_slice(&report.branches);
         Ok(())
     }
 
@@ -332,11 +364,25 @@ impl MergedReport {
         Ok((ranges, executed))
     }
 
+    /// One block reported by several workers is one branch; its `taken` counts
+    /// add up, the way `line_hits` do.
+    fn merge_branches(mut all: Vec<BranchRecord>) -> Vec<BranchRecord> {
+        all.sort_unstable_by_key(|b| (b.line, b.start));
+        all.dedup_by(|next, kept| {
+            (next.line, next.start) == (kept.line, kept.start) && {
+                kept.taken = kept.taken.saturating_add(next.taken);
+                true
+            }
+        });
+        all
+    }
+
     pub fn finish(self) -> Result<Report<'static>, bun_alloc::AllocError> {
         let mut executable_lines = self.executable_in_all;
         executable_lines.set_union(&self.executed_in_any);
         let (functions, functions_which_have_executed) = Self::dedupe(self.functions)?;
         let (stmts, stmts_which_have_executed) = Self::dedupe(self.stmts)?;
+        let branches = Self::merge_branches(self.branches);
         Ok(Report {
             source_url: Cow::Owned(self.source_url),
             executable_lines,
@@ -346,6 +392,7 @@ impl MergedReport {
             functions_which_have_executed,
             stmts,
             stmts_which_have_executed,
+            branches,
         })
     }
 }
@@ -535,15 +582,45 @@ pub mod lcov {
             report.functions_which_have_executed.count()
         )?;
 
+        // BRDA: line, block number, branch number, taken
+        //
+        // JSC's control-flow profiler reports no branch grouping, so each basic
+        // block is emitted as its own single-branch block: block number 0 and a
+        // branch number that is the block's ordinal on its line. `report.branches`
+        // is sorted by `(line, start)`, so those ordinals are stable run to run.
+        let mut branch_number: u32 = 0;
+        let mut prev_line = u32::MAX;
+        let mut branches_hit: usize = 0;
+        for branch in &report.branches {
+            if branch.line == prev_line {
+                branch_number += 1;
+            } else {
+                branch_number = 0;
+                prev_line = branch.line;
+            }
+            if branch.taken > 0 {
+                branches_hit += 1;
+            }
+            writeln!(
+                writer,
+                "BRDA:{},0,{},{}",
+                branch.line + 1,
+                branch_number,
+                branch.taken
+            )?;
+        }
+
+        // BRF: branches found
+        writeln!(writer, "BRF:{}", report.branches.len())?;
+
+        // BRH: branches hit
+        writeln!(writer, "BRH:{}", branches_hit)?;
+
         // ** Track all executable lines **
         // Executable lines that were not hit should be marked as 0
         // `DynamicBitSet::iterator` borrows `&self`, so no clone is needed.
         let mut iter = report.executable_lines.iterator::<true, true>();
 
-        // ** Branch coverage not supported yet, since JSC does not support those yet. ** //
-        // BRDA: line, block, (expressions,count)+
-        // BRF: branches found
-        // BRH: branches hit
         let line_hits = report.line_hits.slice();
         while let Some(line) = iter.next() {
             // DA: line number, hit count
@@ -709,6 +786,9 @@ impl ByteRangeMapping {
         let mut stmts: Vec<ByteRange> = Vec::new();
         stmts.reserve_exact(blocks.len());
 
+        let mut branches: Vec<BranchRecord> = Vec::new();
+        branches.reserve_exact(blocks.len());
+
         let line_count: u32;
 
         if ignore_sourcemap || parsed_mappings_.is_none() {
@@ -762,6 +842,7 @@ impl ByteRangeMapping {
                         stmts_which_have_executed.set(stmts.len());
                     }
 
+                    branches.push(BranchRecord::of(block, min_line, min));
                     stmts.push(ByteRange::of(min, max));
                 }
             }
@@ -898,6 +979,7 @@ impl ByteRangeMapping {
                     if has_executed {
                         stmts_which_have_executed.set(stmts.len());
                     }
+                    branches.push(BranchRecord::of(block, min_line, min));
                     stmts.push(ByteRange::of(min, max));
                 }
             }
@@ -994,6 +1076,9 @@ impl ByteRangeMapping {
 
         functions_which_have_executed.resize(functions.len(), false)?;
         stmts_which_have_executed.resize(stmts.len(), false)?;
+        // JSC iterates its block cache in hash order, so sort for a stable
+        // `BRDA` branch ordinal per line.
+        branches.sort_unstable();
 
         Ok(Report {
             source_url: Cow::Borrowed(source_url),
@@ -1004,6 +1089,7 @@ impl ByteRangeMapping {
             stmts,
             functions_which_have_executed,
             stmts_which_have_executed,
+            branches,
         })
     }
 
@@ -1123,6 +1209,41 @@ pub use bun_options_types::code_coverage_options::Fraction;
 pub struct ByteRange {
     pub start: u32,
     pub end: u32,
+}
+
+/// One JSC basic block projected onto the original source, as lcov's branch
+/// model wants it: the line its code starts on and how many times it ran.
+///
+/// JSC's control-flow profiler has no notion of "these two arms belong to the
+/// same `if`" — `getExecutedRanges()` subtracts nested blocks from their
+/// parent, so what reaches us is a flat set of disjoint ranges. This is
+/// therefore V8-style *block* coverage, not Istanbul `branchMap` coverage:
+/// every block is one `BRDA` entry rather than one arm of a grouped branch.
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BranchRecord {
+    /// Zero-based line in the original source.
+    pub line: u32,
+    /// Start offset in the generated source. Ordering key only.
+    pub start: u32,
+    /// Execution count, or `u32::MAX` if JSC's count overflows a u32.
+    pub taken: u32,
+}
+
+impl BranchRecord {
+    fn of(block: &BasicBlockRange, line: u32, start: usize) -> BranchRecord {
+        // `has_executed` without a count means the block ran but JSC's counter
+        // is unavailable for it; report it taken once rather than untaken.
+        let taken = match u32::try_from(block.execution_count) {
+            Ok(0) if block.has_executed => 1,
+            Ok(n) => n,
+            Err(_) => u32::MAX,
+        };
+        BranchRecord {
+            line,
+            start: u32::try_from(start).expect("int cast"),
+            taken,
+        }
+    }
 }
 
 impl ByteRange {
