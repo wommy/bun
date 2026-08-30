@@ -622,13 +622,18 @@ pub mod lcov {
             report.functions_which_have_executed.count()
         )?;
 
-        let branches_hit = write_branch_records(&report.branches, writer)?;
+        if bun_core::env_var::feature_flag::BUN_FEATURE_FLAG_EXPERIMENTAL_COVERAGE_BRANCHES
+            .get()
+            .unwrap_or(false)
+        {
+            let branches_hit = write_branch_records(&report.branches, writer)?;
 
-        // BRF: branches found
-        writeln!(writer, "BRF:{}", report.branches.len())?;
+            // BRF: branches found
+            writeln!(writer, "BRF:{}", report.branches.len())?;
 
-        // BRH: branches hit
-        writeln!(writer, "BRH:{}", branches_hit)?;
+            // BRH: branches hit
+            writeln!(writer, "BRH:{}", branches_hit)?;
+        }
 
         // ** Track all executable lines **
         // Executable lines that were not hit should be marked as 0

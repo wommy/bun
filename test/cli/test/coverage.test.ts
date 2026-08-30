@@ -720,7 +720,7 @@ test("only the positive arm", () => {
 
   await using proc = Bun.spawn({
     cmd: [bunExe(), "test", "--coverage", "--coverage-reporter=lcov"],
-    env: bunEnv,
+    env: { ...bunEnv, BUN_FEATURE_FLAG_EXPERIMENTAL_COVERAGE_BRANCHES: "1" },
     cwd: String(dir),
     stdout: "pipe",
     stderr: "pipe",
@@ -766,7 +766,7 @@ test("one arm", () => {
     using dir = tempDir("cov-branch-stable", files);
     await using proc = Bun.spawn({
       cmd: [bunExe(), "test", "--coverage", "--coverage-reporter=lcov"],
-      env: bunEnv,
+      env: { ...bunEnv, BUN_FEATURE_FLAG_EXPERIMENTAL_COVERAGE_BRANCHES: "1" },
       cwd: String(dir),
       stdout: "pipe",
       stderr: "pipe",
@@ -784,6 +784,48 @@ test("one arm", () => {
   const second = await runOnce();
   expect(first).toBe(second);
   expect(first).not.toBe("");
+});
+
+// Branch records are gated because they are not sound yet: JSC opens a basic
+// block after every `return` and `throw`, and those blocks are unreachable, so
+// a branchless function that is fully exercised still reports uncovered
+// branches. Both halves matter — the default must stay silent, and the flag
+// must actually turn emission on.
+test("lcov emits branch records only under the experimental flag", async () => {
+  const files = {
+    "plain.ts": `export function noBranches(a: number) {
+  return a + 1;
+}
+`,
+    "plain.test.ts": `import { test, expect } from "bun:test";
+import { noBranches } from "./plain";
+test("fully exercised", () => {
+  expect(noBranches(1)).toBe(2);
+});
+`,
+  };
+
+  const run = async (env: Record<string, string | undefined>) => {
+    using dir = tempDir("cov-branch-gate", files);
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "test", "--coverage", "--coverage-reporter=lcov"],
+      env,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(exitCode).toBe(0);
+    return readFileSync(path.join(String(dir), "coverage", "lcov.info"), "utf-8");
+  };
+
+  const off = await run(bunEnv);
+  expect(off).not.toMatch(/^BRDA:/m);
+  expect(off).not.toMatch(/^BRF:/m);
+  expect(off).not.toMatch(/^BRH:/m);
+
+  const on = await run({ ...bunEnv, BUN_FEATURE_FLAG_EXPERIMENTAL_COVERAGE_BRANCHES: "1" });
+  expect(on).toMatch(/^BRDA:/m);
 });
 
 // Pins documented behavior: docs/test/code-coverage.mdx says of the object
