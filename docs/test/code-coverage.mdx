@@ -103,6 +103,30 @@ coverageReporter = "lcov"
 bun test --coverage --coverage-reporter=lcov
 ```
 
+#### Branch records
+
+The lcov report includes branch records (`BRDA`, `BRF`, `BRH`) alongside the
+line (`DA`) and function (`FNF`/`FNH`) records, so coverage services and
+editor gutters can show branch granularity. The console table does not have a
+branch column.
+
+These are **block** coverage, in the style of V8's, rather than Istanbul's
+grouped branch model. JavaScriptCore's control-flow profiler reports basic
+blocks with no record of which ones are arms of the same branch, so each block
+is emitted as its own single-branch block: block number `0`, and a branch
+number that is the block's ordinal on its line. Branch percentages computed
+from these will not match Jest's or Vitest's exactly.
+
+Constructs JavaScriptCore does not emit a profile point for produce no branch
+records at all, rather than records that wrongly look taken:
+
+| Reported                                            | Not reported                                     |
+| --------------------------------------------------- | ------------------------------------------------ |
+| `if`/`else`, ternaries, `switch` cases, loops, `try`/`catch`/`finally` | `&&`, `\|\|`, `??`, `?.`, default parameters, class field initializers |
+
+So a file whose only branching is a `??` fallback reports no branches, and one
+mixing both reports only the branches from the left column.
+
 Tools and services that read the LCOV format include:
 
 - **Code editors**: VS Code extensions can show coverage inline
