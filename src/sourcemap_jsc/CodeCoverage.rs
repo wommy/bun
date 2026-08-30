@@ -878,18 +878,19 @@ impl ByteRangeMapping {
                     max_line = max_line.max(line);
                 }
 
-                // no lines resolved? ignore it, as the source-map path does. A
-                // zero-width function range leaves min_line unset, and the
-                // `fill` below would index [u32::MAX..0] and panic.
-                if min_line == u32::MAX && max_line == 0 {
-                    continue;
-                }
-
                 let did_fn_execute = function.execution_count > 0 || function.has_executed;
 
                 // only mark the lines as executable if the function has not executed
                 // functions that have executed have non-executable lines in them and thats fine.
-                if !did_fn_execute {
+                //
+                // `min_line` stays u32::MAX when the range resolved to no line at
+                // all (a zero-width function range, which JSC does emit — see the
+                // `end > start` filter over the same data in
+                // src/js/node/inspector.ts). The slice range below would then be
+                // [u32::MAX..0] and panic. The source-map path skips such a
+                // function outright; this only skips the marking, so that the
+                // function still counts toward FNF exactly as it does today.
+                if !did_fn_execute && min_line != u32::MAX {
                     let end = max_line.min(line_count);
                     line_hits_slice[min_line as usize..end as usize].fill(0);
                     for line in min_line..end {
