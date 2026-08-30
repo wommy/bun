@@ -1286,15 +1286,10 @@ mod branch_tests {
     /// This calls the helper rather than `lcov::write_format`, which reaches
     /// `bun_paths::resolve_path::relative`; linking a test binary against that
     /// needs Highway's SIMD kernels, which `cargo test` does not build.
-    fn brda(branches: &[BranchRecord]) -> (Vec<String>, usize) {
+    fn brda(branches: &[BranchRecord]) -> (Vec<u8>, usize) {
         let mut buf: Vec<u8> = Vec::new();
         let hit = lcov::write_branch_records(branches, &mut buf).unwrap();
-        let lines = String::from_utf8(buf)
-            .unwrap()
-            .lines()
-            .map(str::to_owned)
-            .collect();
-        (lines, hit)
+        (buf, hit)
     }
 
     /// A report with no lines or functions, carrying only `branches` — enough
@@ -1318,12 +1313,12 @@ mod branch_tests {
     fn branch_number_restarts_on_each_line() {
         // Two blocks on line 4 (zero-based), one on line 9. lcov lines are
         // 1-based and the branch number is the ordinal within the line.
-        let (lines, hit) = brda(&[
+        let (out, hit) = brda(&[
             BranchRecord { line: 4, start: 10, taken: 3 },
             BranchRecord { line: 4, start: 20, taken: 0 },
             BranchRecord { line: 9, start: 30, taken: 1 },
         ]);
-        assert_eq!(lines, vec!["BRDA:5,0,0,3", "BRDA:5,0,1,0", "BRDA:10,0,0,1"]);
+        assert_eq!(out, b"BRDA:5,0,0,3\nBRDA:5,0,1,0\nBRDA:10,0,0,1\n".to_vec());
         // The untaken arm on line 5 must not count toward BRH.
         assert_eq!(hit, 2);
     }
