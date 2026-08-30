@@ -294,7 +294,7 @@ coverageThreshold = 0.8
 coverageThreshold = { lines = 0.9, functions = 0.8 }
 ```
 
-Setting a threshold makes `bun test` exit with code 1 when coverage is enabled and any file's line or function coverage is below it. Bun accepts the `statements` key but does not currently enforce it. The check applies with any coverage reporter.
+Setting a threshold makes `bun test` exit with code 1 when coverage is enabled and any file's line or function coverage is below it. In the object form, a key you omit keeps its `0.9` default rather than going unchecked, so naming one metric still enforces the others. Bun accepts the `statements` key but does not currently enforce it. The check applies with any coverage reporter.
 
 #### Threshold Examples
 
