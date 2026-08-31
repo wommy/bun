@@ -635,7 +635,9 @@ test("only imports the function", () => {
   const record = lcov.split("end_of_record").find(r => r.includes("SF:subject.ts"));
   expect(record).toBeDefined();
   // Blank line 5 is only "executable" in the worker that never ran count().
-  expect(record).not.toContain("DA:5,");
+  // Anchored: a plain substring check also matches the `BRDA:5,` branch
+  // records, which are a different assertion entirely.
+  expect(record).not.toMatch(/^DA:5,/m);
   expect(record).toMatch(/LF:4\nLH:4\n/);
 
   expect(stderr).toMatch(/ subject\.ts +\| +100\.00 +\| +100\.00 +\| +\n/);
@@ -696,6 +698,134 @@ test("calls second", () => {
   const record = lcov.split("end_of_record").find(r => r.includes("SF:subject.ts"));
   expect(record).toMatch(/FNF:2\nFNH:2\n/);
   expect(exitCode).toBe(0);
+});
+
+test("lcov reporter emits branch records", async () => {
+  using dir = tempDir("cov-branches", {
+    "branches.ts": `export function classify(n: number) {
+  if (n > 0) {
+    return "pos";
+  } else {
+    return "neg";
+  }
+}
+`,
+    "branches.test.ts": `import { test, expect } from "bun:test";
+import { classify } from "./branches";
+test("only the positive arm", () => {
+  expect(classify(1)).toBe("pos");
+});
+`,
+  });
+
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "test", "--coverage", "--coverage-reporter=lcov"],
+    env: { ...bunEnv, BUN_FEATURE_FLAG_EXPERIMENTAL_COVERAGE_BRANCHES: "1" },
+    cwd: String(dir),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+
+  const lcov = readFileSync(path.join(String(dir), "coverage", "lcov.info"), "utf-8");
+  const record = lcov.split("end_of_record").find(r => r.includes("SF:branches.ts"))!;
+  expect(record).toBeDefined();
+
+  // The `else` arm never runs, so the file must report more branches found
+  // than hit, with at least one BRDA whose taken count is 0.
+  const found = Number(record.match(/^BRF:(\d+)$/m)![1]);
+  const hit = Number(record.match(/^BRH:(\d+)$/m)![1]);
+  expect(found).toBeGreaterThan(0);
+  expect(hit).toBeGreaterThan(0);
+  expect(hit).toBeLessThan(found);
+  expect(record).toMatch(/^BRDA:\d+,0,\d+,0$/m);
+
+  // BRF/BRH must agree with the BRDA records they summarize.
+  const brda = [...record.matchAll(/^BRDA:(\d+),0,(\d+),(\d+)$/gm)];
+  expect(brda.length).toBe(found);
+  expect(brda.filter(m => Number(m[3]) > 0).length).toBe(hit);
+
+  expect(exitCode).toBe(0);
+});
+
+test("lcov branch records are stable across runs", async () => {
+  const files = {
+    "stable.ts": `export function pick(n: number) {
+  return n === 1 ? "one" : n === 2 ? "two" : "three";
+}
+`,
+    "stable.test.ts": `import { test, expect } from "bun:test";
+import { pick } from "./stable";
+test("one arm", () => {
+  expect(pick(1)).toBe("one");
+});
+`,
+  };
+
+  const runOnce = async () => {
+    using dir = tempDir("cov-branch-stable", files);
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "test", "--coverage", "--coverage-reporter=lcov"],
+      env: { ...bunEnv, BUN_FEATURE_FLAG_EXPERIMENTAL_COVERAGE_BRANCHES: "1" },
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(exitCode).toBe(0);
+    const lcov = readFileSync(path.join(String(dir), "coverage", "lcov.info"), "utf-8");
+    const record = lcov.split("end_of_record").find(r => r.includes("SF:stable.ts"))!;
+    return [...record.matchAll(/^BRDA:.*$/gm)].map(m => m[0]).join("\n");
+  };
+
+  // JSC iterates its basic-block cache in hash order, so the branch ordinals
+  // are only reproducible because the report sorts by (line, start).
+  const first = await runOnce();
+  const second = await runOnce();
+  expect(first).toBe(second);
+  expect(first).not.toBe("");
+});
+
+// Branch records are gated because they are not sound yet: JSC opens a basic
+// block after every `return` and `throw`, and those blocks are unreachable, so
+// a branchless function that is fully exercised still reports uncovered
+// branches. Both halves matter — the default must stay silent, and the flag
+// must actually turn emission on.
+test("lcov emits branch records only under the experimental flag", async () => {
+  const files = {
+    "plain.ts": `export function noBranches(a: number) {
+  return a + 1;
+}
+`,
+    "plain.test.ts": `import { test, expect } from "bun:test";
+import { noBranches } from "./plain";
+test("fully exercised", () => {
+  expect(noBranches(1)).toBe(2);
+});
+`,
+  };
+
+  const run = async (env: Record<string, string | undefined>) => {
+    using dir = tempDir("cov-branch-gate", files);
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "test", "--coverage", "--coverage-reporter=lcov"],
+      env,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect(exitCode).toBe(0);
+    return readFileSync(path.join(String(dir), "coverage", "lcov.info"), "utf-8");
+  };
+
+  const off = await run(bunEnv);
+  expect(off).not.toMatch(/^BRDA:/m);
+  expect(off).not.toMatch(/^BRF:/m);
+  expect(off).not.toMatch(/^BRH:/m);
+
+  const on = await run({ ...bunEnv, BUN_FEATURE_FLAG_EXPERIMENTAL_COVERAGE_BRANCHES: "1" });
+  expect(on).toMatch(/^BRDA:/m);
 });
 
 // Pins documented behavior: docs/test/code-coverage.mdx says of the object

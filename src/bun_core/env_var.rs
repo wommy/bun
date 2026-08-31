@@ -227,6 +227,13 @@ pub mod feature_flag {
     new_feature_flag!(pub BUN_FEATURE_FLAG_DISABLE_DNS_CACHE, "BUN_FEATURE_FLAG_DISABLE_DNS_CACHE", {});
     new_feature_flag!(pub BUN_FEATURE_FLAG_DISABLE_FETCH_TLS_SESSION_CACHE, "BUN_FEATURE_FLAG_DISABLE_FETCH_TLS_SESSION_CACHE", {});
     new_feature_flag!(pub BUN_FEATURE_FLAG_DISABLE_DNS_CACHE_LIBINFO, "BUN_FEATURE_FLAG_DISABLE_DNS_CACHE_LIBINFO", {});
+
+    // Emit lcov BRDA/BRF/BRH branch records from JSC basic blocks. Off until
+    // JSC distinguishes a branch arm from a continuation: it opens a block
+    // after every `return`, `throw`, `break` and `continue`, and those blocks
+    // are unreachable, so a branchless function that is fully exercised still
+    // reports uncovered "branches".
+    new_feature_flag!(pub BUN_FEATURE_FLAG_EXPERIMENTAL_COVERAGE_BRANCHES, "BUN_FEATURE_FLAG_EXPERIMENTAL_COVERAGE_BRANCHES", {});
     // Force the event loop to use epoll_pwait(2) instead of epoll_pwait2(2).
     // Escape hatch for seccomp policies that block syscall 441 without
     // returning a checkable errno (Android app sandbox, some container

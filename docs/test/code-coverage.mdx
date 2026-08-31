@@ -103,6 +103,48 @@ coverageReporter = "lcov"
 bun test --coverage --coverage-reporter=lcov
 ```
 
+#### Branch records (experimental)
+
+Set `BUN_FEATURE_FLAG_EXPERIMENTAL_COVERAGE_BRANCHES=1` to add lcov branch
+records (`BRDA`, `BRF`, `BRH`) to the report. They are off by default because
+the numbers are not trustworthy yet, and they are wrong in both directions. The
+console table has no branch column either way.
+
+JavaScriptCore's control-flow profiler reports basic blocks, not branches, and
+three consequences follow:
+
+- It opens a block after every `return`, `throw`, `break` and `continue`. Those
+  blocks are unreachable, so they are reported as uncovered branches that no
+  test can ever cover. A function with no branching at all, fully exercised,
+  reports `BRF:3 BRH:2`.
+- It emits no profile point for `&&`, `||`, `??` or `?.`. Covering the
+  right-hand side of one does not change the numbers at all. Any zero next to
+  such an expression is one of the unreachable blocks above, not the
+  short-circuit arm.
+- An `if` with no `else` opens a block only for the arm that runs. The implicit
+  else path has no block, so it can never be reported as uncovered. Adding a test
+  that takes the false path changes execution counts but not which records are
+  hit. An explicit `else` does get its own record.
+
+Reported at all: `if`/`else`, ternaries, `switch` cases, loops, and
+`try`/`catch`/`finally`. Even for those the totals are inflated by the
+unreachable blocks, so a percentage computed from `BRF`/`BRH` is not comparable
+to c8, Jest or Vitest.
+
+These interact, so fixing one alone makes the output worse. Dropping the
+unreachable blocks without also emitting one for the implicit else arm would
+leave a bare `if` reporting a single branch that the true path already covers —
+a confident 100% for code whose false path was never tested. The present
+over-reporting is at least visible.
+
+Until JavaScriptCore distinguishes a block that opens a branch arm from one that
+merely continues after a terminator, _and_ records the arm an `if` does not take,
+treat this output as a preview rather than a metric to gate on.
+
+You cannot gate on it in any case: `test.coverageThreshold` understands `lines`,
+`functions` and `statements` only. A `branches` key in that table is accepted and
+silently ignored, so it enforces nothing.
+
 Tools and services that read the LCOV format include:
 
 - **Code editors**: VS Code extensions can show coverage inline
